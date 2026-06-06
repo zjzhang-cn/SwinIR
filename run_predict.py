@@ -411,7 +411,7 @@ def get_window_size(task):
 # 4. 模型推理
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def run_inference(img_lq, model, args, window_size, progress_callback=None):
+def run_inference(img_lq, model, args, window_size, progress_callback=None, cancel_event=None):
     """
     模型推理核心函数，支持整图推理和分块（tile）推理两种模式。
 
@@ -489,6 +489,11 @@ def run_inference(img_lq, model, args, window_size, progress_callback=None):
             # 调用进度回调（供 Web 服务等外部调用者使用）
             if progress_callback:
                 progress_callback(tile_idx, total_tiles)
+
+            # 检查是否取消推理
+            if cancel_event and cancel_event.is_set():
+                print(f'\n推理已取消（{tile_idx}/{total_tiles}）')
+                return None
 
             # 从大图中裁出当前块 [h_idx:h_idx+tile, w_idx:w_idx+tile]
             # 注意：此时大图已经过窗口填充，padding 区域由 flip padding 填充

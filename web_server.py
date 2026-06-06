@@ -51,6 +51,7 @@ from run_predict import (
 model = None
 device = None
 base_args = None  # 基础配置（model_path、task、scale 等）
+current_cancel_event = threading.Event()  # 当前运行中的推理取消信号
 
 
 def create_args(**overrides):
@@ -249,8 +250,8 @@ def _decode_image(contents: bytes, task: str):
 
 def _do_inference(img_lq: np.ndarray, task: str, scale: int, noise: int,
                   jpeg: int, large_model: bool, tile, tile_overlap: int,
-                  progress_queue: queue.Queue):
-    """在后台线程中执行推理，通过 progress_queue 发送进度。"""
+                  progress_queue: queue.Queue, cancel_event: threading.Event = None):
+    """在后台线程中执行推理，通过 progress_queue 发送进度，通过 cancel_event 支持取消。"""
     try:
         args = create_args(
             task=task, scale=scale, noise=noise, jpeg=jpeg,
@@ -266,13 +267,23 @@ def _do_inference(img_lq: np.ndarray, task: str, scale: int, noise: int,
             tensor = torch.cat([tensor, torch.flip(tensor, [2])], 2)[:, :, :h_old + h_pad, :]
             tensor = torch.cat([tensor, torch.flip(tensor, [3])], 3)[:, :, :, :w_old + w_pad]
 
-            # 如果有 tile，传入进度回调
+            # 如果有 tile，传入进度回调和取消信号
             if tile and tile > 0:
                 def on_progress(current, total):
+                    if cancel_event and cancel_event.is_set():
+                        raise InterruptedError('客户端断开连接')
                     progress_queue.put({'type': 'progress', 'current': current, 'total': total})
-                output = run_inference(tensor, model, args, window_size, progress_callback=on_progress)
+                output = run_inference(tensor, model, args, window_size,
+                                       progress_callback=on_progress,
+                                       cancel_event=cancel_event)
             else:
-                output = run_inference(tensor, model, args, window_size)
+                output = run_inference(tensor, model, args, window_size,
+                                       cancel_event=cancel_event)
+
+        # output 为 None 表示推理被取消
+        if output is None:
+            progress_queue.put({'type': 'error', 'message': '推理已取消（客户端断开连接）'})
+            return
 
         result = tensor_to_image(output, task, h_old, w_old, scale)
         success, encoded = cv2.imencode('.png', result)
@@ -310,35 +321,49 @@ async def predict_stream(
     except Exception as e:
         raise HTTPException(status_code=400, detail=f'图像读取失败: {str(e)}')
 
+    # 取消上一次推理（同一页面只允许一个推理任务）
+    global current_cancel_event
+    if not current_cancel_event.is_set():
+        current_cancel_event.set()
+        print('[会话管理] 取消上一次推理')
+
     q = queue.Queue()
+    cancel_event = threading.Event()
+    current_cancel_event = cancel_event  # 更新全局引用
 
     def sse_generator():
         # 启动后台推理线程
         thread = threading.Thread(
             target=_do_inference,
-            args=(img_lq, task, scale, noise, jpeg, large_model, tile, tile_overlap, q),
+            args=(img_lq, task, scale, noise, jpeg, large_model, tile, tile_overlap, q, cancel_event),
             daemon=True,
         )
         thread.start()
 
-        while True:
-            try:
-                event = q.get(timeout=1)
-                if event['type'] == 'progress':
-                    yield f'data: {{"type":"progress","current":{event["current"]},"total":{event["total"]}}}\n\n'
-                elif event['type'] == 'done':
-                    yield f'data: {{"type":"done","image":"data:image/png;base64,{event["image"]}"}}\n\n'
-                    yield 'data: {"type":"end"}\n\n'
-                    break
-                elif event['type'] == 'error':
-                    yield f'data: {{"type":"error","message":"{event["message"]}"}}\n\n'
-                    yield 'data: {"type":"end"}\n\n'
-                    break
-            except queue.Empty:
-                # 发送心跳保持连接
-                yield ': heartbeat\n\n'
-                if not thread.is_alive():
-                    break
+        try:
+            while True:
+                try:
+                    event = q.get(timeout=1)
+                    if event['type'] == 'progress':
+                        yield f'data: {{"type":"progress","current":{event["current"]},"total":{event["total"]}}}\n\n'
+                    elif event['type'] == 'done':
+                        yield f'data: {{"type":"done","image":"data:image/png;base64,{event["image"]}"}}\n\n'
+                        yield 'data: {"type":"end"}\n\n'
+                        break
+                    elif event['type'] == 'error':
+                        yield f'data: {{"type":"error","message":"{event["message"]}"}}\n\n'
+                        yield 'data: {"type":"end"}\n\n'
+                        break
+                except queue.Empty:
+                    # 发送心跳保持连接
+                    yield ': heartbeat\n\n'
+                    if not thread.is_alive():
+                        break
+        except GeneratorExit:
+            # 客户端断开连接（关闭页面），触发取消信号停止推理
+            cancel_event.set()
+            print('[推理取消] 客户端断开连接，停止推理')
+            raise
 
     return StreamingResponse(
         sse_generator(),
