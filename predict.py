@@ -56,7 +56,12 @@ class Predictor(cog.Predictor):
 
         self.args = parser.parse_args('')
 
-        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        if torch.cuda.is_available():
+            self.device = torch.device('cuda')
+        elif torch.backends.mps.is_available():
+            self.device = torch.device('mps')
+        else:
+            self.device = torch.device('cpu')
 
         self.tasks = {
             'Real-World Image Super-Resolution': 'real_sr',
