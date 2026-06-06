@@ -176,6 +176,20 @@
   .toggle-icon.open { transform: rotate(90deg); }
   .collapsible-content { overflow: hidden; transition: max-height .35s ease; }
   .collapsible-content.collapsed { max-height: 0 !important; }
+
+  /* ── 进度条 ── */
+  .progress-bar-wrap {
+    margin-top: 12px; background: var(--surface2); border-radius: 8px;
+    height: 10px; overflow: hidden; display: none;
+  }
+  .progress-bar-wrap.show { display: block; }
+  .progress-bar-fill {
+    height: 100%; background: linear-gradient(90deg, var(--accent), var(--accent2));
+    border-radius: 8px; transition: width .15s ease; width: 0%;
+  }
+  .progress-text { font-size: .78rem; color: var(--text2); margin-top: 4px; text-align: center; display: none; }
+  .progress-text.show { display: block; }
+
   @media (max-width: 640px) {
     .preview-area { grid-template-columns: 1fr; }
     .preview-arrow { transform: rotate(90deg); }
@@ -287,6 +301,12 @@
         🔄 重新上传
       </button>
     </div>
+
+    <!-- 分块推理进度条 -->
+    <div class="progress-bar-wrap" id="progressBarWrap">
+      <div class="progress-bar-fill" id="progressBarFill"></div>
+    </div>
+    <div class="progress-text" id="progressText"></div>
   </div>
 
   <!-- ═══════════════ 使用说明 ═══════════════ -->
@@ -437,29 +457,44 @@ function handleFile(file) {
   hideStatus();
 }
 
+const progressBarWrap  = document.getElementById('progressBarWrap');
+const progressBarFill  = document.getElementById('progressBarFill');
+const progressText     = document.getElementById('progressText');
+
+function showProgress(show) {
+  progressBarWrap.classList.toggle('show', show);
+  progressText.classList.toggle('show', show);
+  if (!show) { progressBarFill.style.width = '0%'; progressText.textContent = ''; }
+}
+function updateProgress(current, total) {
+  const pct = Math.round(current / total * 100);
+  progressBarFill.style.width = pct + '%';
+  progressText.textContent = `分块推理中：${current} / ${total}（${pct}%）`;
+}
+
 // ══════════════════════════════════════════════════════════════════
-// 增强请求
+// 增强请求（无 tile 用普通请求，有 tile 用 SSE 流式进度）
 // ══════════════════════════════════════════════════════════════════
 btnEnhance.addEventListener('click', async () => {
   if (!selectedFile) return;
 
+  const tileVal = document.getElementById('paramTile').value;
+  const useStreaming = tileVal && parseInt(tileVal) > 0;
+
+  if (useStreaming) {
+    await enhanceWithStreaming();
+  } else {
+    await enhancePlain();
+  }
+});
+
+async function enhancePlain() {
   showStatus('loading', '正在增强中，请耐心等待…');
   statusSpinner.style.display = '';
   btnEnhance.disabled = true;
+  showProgress(false);
 
-  const formData = new FormData();
-  formData.append('image', selectedFile);
-  formData.append('task', currentTask);
-  formData.append('scale', document.getElementById('paramScale').value);
-  if (document.getElementById('noiseGroup').style.display !== 'none')
-    formData.append('noise', document.getElementById('paramNoise').value);
-  if (document.getElementById('jpegGroup').style.display !== 'none')
-    formData.append('jpeg', document.getElementById('paramJpeg').value);
-  if (document.getElementById('largeGroup').style.display !== 'none' && document.getElementById('paramLarge').checked)
-    formData.append('large_model', 'true');
-  const tileVal = document.getElementById('paramTile').value;
-  if (tileVal && parseInt(tileVal) > 0) formData.append('tile', tileVal);
-
+  const formData = buildFormData();
   try {
     const resp = await fetch(`${API_BASE}/predict`, { method: 'POST', body: formData });
     if (!resp.ok) {
@@ -467,11 +502,7 @@ btnEnhance.addEventListener('click', async () => {
       throw new Error(err.detail || `HTTP ${resp.status}`);
     }
     resultBlob = await resp.blob();
-    const url = URL.createObjectURL(resultBlob);
-    previewOutput.src = url;
-    previewOutput.style.display = '';
-    outputPlaceholder.style.display = 'none';
-    document.getElementById('btnDownload').style.display = '';
+    showResult();
     showStatus('success', '增强完成！');
   } catch (err) {
     showStatus('error', `增强失败：${err.message}`);
@@ -479,7 +510,89 @@ btnEnhance.addEventListener('click', async () => {
     statusSpinner.style.display = 'none';
     btnEnhance.disabled = false;
   }
-});
+}
+
+async function enhanceWithStreaming() {
+  showStatus('loading', '正在增强中…');
+  statusSpinner.style.display = 'none';
+  btnEnhance.disabled = true;
+  showProgress(true);
+  updateProgress(0, 1);
+
+  const formData = buildFormData();
+  try {
+    const resp = await fetch(`${API_BASE}/predict-stream`, { method: 'POST', body: formData });
+    if (!resp.ok) {
+      const err = await resp.json().catch(() => ({ detail: resp.statusText }));
+      throw new Error(err.detail || `HTTP ${resp.status}`);
+    }
+
+    const reader = resp.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+
+      // 解析 SSE 事件（按 \n\n 分隔）
+      const parts = buffer.split('\n\n');
+      buffer = parts.pop(); // 最后一段可能不完整，保留到下次
+
+      for (const part of parts) {
+        if (!part.trim() || part.startsWith(':')) continue;
+        const line = part.split('\n').find(l => l.startsWith('data: '));
+        if (!line) continue;
+        try {
+          const data = JSON.parse(line.slice(6));
+          if (data.type === 'progress') {
+            updateProgress(data.current, data.total);
+          } else if (data.type === 'done') {
+            previewOutput.src = data.image;  // data:image/png;base64,...
+            previewOutput.style.display = '';
+            outputPlaceholder.style.display = 'none';
+            document.getElementById('btnDownload').style.display = '';
+            showStatus('success', '增强完成！');
+          } else if (data.type === 'error') {
+            throw new Error(data.message);
+          }
+        } catch (e) {
+          if (e.message && !e.message.startsWith('SyntaxError')) throw e;
+        }
+      }
+    }
+  } catch (err) {
+    showStatus('error', `增强失败：${err.message}`);
+  } finally {
+    showProgress(false);
+    btnEnhance.disabled = false;
+  }
+}
+
+function buildFormData() {
+  const fd = new FormData();
+  fd.append('image', selectedFile);
+  fd.append('task', currentTask);
+  fd.append('scale', document.getElementById('paramScale').value);
+  if (document.getElementById('noiseGroup').style.display !== 'none')
+    fd.append('noise', document.getElementById('paramNoise').value);
+  if (document.getElementById('jpegGroup').style.display !== 'none')
+    fd.append('jpeg', document.getElementById('paramJpeg').value);
+  if (document.getElementById('largeGroup').style.display !== 'none' && document.getElementById('paramLarge').checked)
+    fd.append('large_model', 'true');
+  const tileVal = document.getElementById('paramTile').value;
+  if (tileVal && parseInt(tileVal) > 0) fd.append('tile', tileVal);
+  return fd;
+}
+
+function showResult() {
+  const url = URL.createObjectURL(resultBlob);
+  previewOutput.src = url;
+  previewOutput.style.display = '';
+  outputPlaceholder.style.display = 'none';
+  document.getElementById('btnDownload').style.display = '';
+}
 
 // ══════════════════════════════════════════════════════════════════
 // 下载 & 重置
@@ -511,6 +624,7 @@ document.getElementById('btnReset').addEventListener('click', () => {
   uploadZone.querySelector('.upload-text').textContent = '点击上传或拖拽图像到此处';
   uploadZone.querySelector('.upload-hint').textContent = '支持 JPG / PNG / BMP / TIFF，最大 50MB';
   hideStatus();
+  showProgress(false);
 });
 
 // ══════════════════════════════════════════════════════════════════

@@ -17,9 +17,12 @@ API 端点：
 """
 
 import argparse
+import base64
 import io
 import os
+import queue
 import sys
+import threading
 from types import SimpleNamespace
 
 import cv2
@@ -30,6 +33,7 @@ from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse, Response
 from PIL import Image
+from starlette.responses import StreamingResponse
 
 # 导入 run_predict.py 中的核心函数
 from run_predict import (
@@ -228,6 +232,125 @@ async def list_tasks():
     }
 
 
+def _decode_image(contents: bytes, task: str):
+    """将上传的图片字节解码为 numpy 数组 (CHW, float32 [0,1])。"""
+    if task in ('gray_dn', 'jpeg_car'):
+        pil_img = Image.open(io.BytesIO(contents)).convert('L')
+        img = np.array(pil_img).astype(np.float32) / 255.
+        img = np.expand_dims(img, axis=0)
+    else:
+        npy = np.frombuffer(contents, np.uint8)
+        img = cv2.imdecode(npy, cv2.IMREAD_COLOR).astype(np.float32) / 255.
+        if img is None:
+            raise ValueError('无法解码图像')
+        img = np.transpose(img[:, :, [2, 1, 0]], (2, 0, 1))
+    return img
+
+
+def _do_inference(img_lq: np.ndarray, task: str, scale: int, noise: int,
+                  jpeg: int, large_model: bool, tile, tile_overlap: int,
+                  progress_queue: queue.Queue):
+    """在后台线程中执行推理，通过 progress_queue 发送进度。"""
+    try:
+        args = create_args(
+            task=task, scale=scale, noise=noise, jpeg=jpeg,
+            large_model=large_model, tile=tile, tile_overlap=tile_overlap,
+        )
+        window_size = get_window_size(task)
+        tensor = torch.from_numpy(img_lq).float().unsqueeze(0).to(device)
+
+        with torch.no_grad():
+            _, _, h_old, w_old = tensor.size()
+            h_pad = (h_old // window_size + 1) * window_size - h_old
+            w_pad = (w_old // window_size + 1) * window_size - w_old
+            tensor = torch.cat([tensor, torch.flip(tensor, [2])], 2)[:, :, :h_old + h_pad, :]
+            tensor = torch.cat([tensor, torch.flip(tensor, [3])], 3)[:, :, :, :w_old + w_pad]
+
+            # 如果有 tile，传入进度回调
+            if tile and tile > 0:
+                def on_progress(current, total):
+                    progress_queue.put({'type': 'progress', 'current': current, 'total': total})
+                output = run_inference(tensor, model, args, window_size, progress_callback=on_progress)
+            else:
+                output = run_inference(tensor, model, args, window_size)
+
+        result = tensor_to_image(output, task, h_old, w_old, scale)
+        success, encoded = cv2.imencode('.png', result)
+        if not success:
+            raise RuntimeError('图像编码失败')
+        img_b64 = base64.b64encode(encoded.tobytes()).decode('utf-8')
+        progress_queue.put({'type': 'done', 'image': img_b64})
+    except Exception as e:
+        progress_queue.put({'type': 'error', 'message': str(e)})
+
+
+@app.post('/predict-stream')
+async def predict_stream(
+    image: UploadFile = File(..., description='待增强的输入图像'),
+    task: str = Form('real_sr'),
+    scale: int = Form(4),
+    noise: int = Form(15),
+    jpeg:  int = Form(40),
+    large_model: bool = Form(False),
+    tile: int = Form(None),
+    tile_overlap: int = Form(32),
+):
+    """分块推理时返回 SSE 进度流，结束时通过 done 事件返回 base64 图像。"""
+    if model is None:
+        raise HTTPException(status_code=503, detail='模型尚未加载')
+
+    valid_tasks = ['classical_sr', 'lightweight_sr', 'real_sr',
+                   'gray_dn', 'color_dn', 'jpeg_car', 'color_jpeg_car']
+    if task not in valid_tasks:
+        raise HTTPException(status_code=400, detail=f'不支持的任务类型: {task}')
+
+    try:
+        contents = await image.read()
+        img_lq = _decode_image(contents, task)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f'图像读取失败: {str(e)}')
+
+    q = queue.Queue()
+
+    def sse_generator():
+        # 启动后台推理线程
+        thread = threading.Thread(
+            target=_do_inference,
+            args=(img_lq, task, scale, noise, jpeg, large_model, tile, tile_overlap, q),
+            daemon=True,
+        )
+        thread.start()
+
+        while True:
+            try:
+                event = q.get(timeout=1)
+                if event['type'] == 'progress':
+                    yield f'data: {{"type":"progress","current":{event["current"]},"total":{event["total"]}}}\n\n'
+                elif event['type'] == 'done':
+                    yield f'data: {{"type":"done","image":"data:image/png;base64,{event["image"]}"}}\n\n'
+                    yield 'data: {"type":"end"}\n\n'
+                    break
+                elif event['type'] == 'error':
+                    yield f'data: {{"type":"error","message":"{event["message"]}"}}\n\n'
+                    yield 'data: {"type":"end"}\n\n'
+                    break
+            except queue.Empty:
+                # 发送心跳保持连接
+                yield ': heartbeat\n\n'
+                if not thread.is_alive():
+                    break
+
+    return StreamingResponse(
+        sse_generator(),
+        media_type='text/event-stream',
+        headers={
+            'Cache-Control': 'no-cache',
+            'Connection': 'keep-alive',
+            'X-Accel-Buffering': 'no',
+        },
+    )
+
+
 @app.post('/predict')
 async def predict(
     image: UploadFile = File(..., description='待增强的输入图像（支持 jpg/png/bmp/tiff）'),
@@ -264,20 +387,7 @@ async def predict(
     # ── 读取上传的图像 ──────────────────────────────────
     try:
         contents = await image.read()
-        # 根据任务类型选择读取方式
-        if task in ('gray_dn', 'jpeg_car'):
-            # 灰度任务：通过 PIL 读取为灰度图，再转为 OpenCV 格式
-            pil_img = Image.open(io.BytesIO(contents)).convert('L')
-            img_lq = np.array(pil_img).astype(np.float32) / 255.
-            img_lq = np.expand_dims(img_lq, axis=0)  # H×W → 1×H×W
-        else:
-            # 彩色任务：numpy → OpenCV BGR → float32 [0,1]
-            npy = np.frombuffer(contents, np.uint8)
-            img_lq = cv2.imdecode(npy, cv2.IMREAD_COLOR).astype(np.float32) / 255.
-            if img_lq is None:
-                raise ValueError('无法解码图像')
-            # HWC-BGR → CHW-RGB
-            img_lq = np.transpose(img_lq[:, :, [2, 1, 0]], (2, 0, 1))
+        img_lq = _decode_image(contents, task)
     except Exception as e:
         raise HTTPException(status_code=400, detail=f'图像读取失败: {str(e)}')
 
