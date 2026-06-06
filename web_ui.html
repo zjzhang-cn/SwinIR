@@ -1,0 +1,530 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>SwinIR 图像增强</title>
+<style>
+  :root {
+    --bg: #0f1117;
+    --surface: #1a1d27;
+    --surface2: #242836;
+    --border: #2e3345;
+    --text: #e1e4ed;
+    --text2: #9095a7;
+    --accent: #6c5ce7;
+    --accent2: #a29bfe;
+    --green: #00b894;
+    --red: #ff7675;
+    --radius: 12px;
+    --shadow: 0 4px 24px rgba(0,0,0,.3);
+  }
+  * { margin:0; padding:0; box-sizing:border-box; }
+  body {
+    font-family: -apple-system, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', sans-serif;
+    background: var(--bg); color: var(--text);
+    min-height: 100vh;
+    display: flex; justify-content: center;
+    padding: 24px 16px;
+  }
+  .container {
+    width: 100%; max-width: 960px;
+    display: flex; flex-direction: column; gap: 20px;
+  }
+
+  /* ── 头部 ── */
+  .header {
+    text-align: center; padding: 32px 24px 8px;
+  }
+  .header h1 {
+    font-size: 2rem; font-weight: 800;
+    background: linear-gradient(135deg, var(--accent2), #fd79a8);
+    -webkit-background-clip: text; -webkit-text-fill-color: transparent;
+    margin-bottom: 8px;
+  }
+  .header .subtitle { color: var(--text2); font-size: .92rem; }
+
+  /* ── 卡片 ── */
+  .card {
+    background: var(--surface); border: 1px solid var(--border);
+    border-radius: var(--radius); padding: 24px;
+    box-shadow: var(--shadow);
+  }
+  .card-title {
+    font-size: 1.05rem; font-weight: 700; margin-bottom: 16px;
+    display: flex; align-items: center; gap: 8px;
+  }
+  .card-title .icon { font-size: 1.3rem; }
+
+  /* ── 任务选择 ── */
+  .task-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
+    gap: 10px;
+  }
+  .task-btn {
+    background: var(--surface2); border: 2px solid transparent;
+    border-radius: var(--radius); padding: 14px 12px;
+    cursor: pointer; text-align: left; color: var(--text);
+    transition: all .2s; font-size: .9rem;
+  }
+  .task-btn:hover { border-color: var(--accent); background: #2a2d3e; }
+  .task-btn.active {
+    border-color: var(--accent); background: rgba(108,92,231,.15);
+    box-shadow: 0 0 0 1px var(--accent);
+  }
+  .task-btn .name { font-weight: 700; font-size: .88rem; }
+  .task-btn .desc { font-size: .76rem; color: var(--text2); margin-top: 4px; }
+
+  /* ── 参数 ── */
+  .params { display: flex; flex-wrap: wrap; gap: 16px; margin-top: 16px; }
+  .param-group { flex: 1; min-width: 140px; }
+  .param-group label {
+    display: block; font-size: .8rem; color: var(--text2);
+    font-weight: 600; margin-bottom: 6px;
+  }
+  .param-group select, .param-group input {
+    width: 100%; padding: 10px 12px; border-radius: 8px;
+    background: var(--surface2); border: 1px solid var(--border);
+    color: var(--text); font-size: .9rem; outline: none;
+    transition: border .2s;
+  }
+  .param-group select:focus, .param-group input:focus { border-color: var(--accent); }
+  .param-group .hint { font-size: .72rem; color: var(--text2); margin-top: 4px; }
+
+  /* ── 上传区域 ── */
+  .upload-zone {
+    border: 2px dashed var(--border); border-radius: var(--radius);
+    padding: 48px 24px; text-align: center; cursor: pointer;
+    transition: all .25s; position: relative;
+  }
+  .upload-zone:hover, .upload-zone.drag-over {
+    border-color: var(--accent); background: rgba(108,92,231,.06);
+  }
+  .upload-zone.has-image { padding: 16px; border-style: solid; }
+  .upload-icon { font-size: 3rem; margin-bottom: 12px; opacity: .5; }
+  .upload-text { font-weight: 700; color: var(--accent2); }
+  .upload-hint { font-size: .8rem; color: var(--text2); margin-top: 6px; }
+  .upload-zone input[type=file] { display: none; }
+
+  /* ── 预览 ── */
+  .preview-area {
+    display: grid; grid-template-columns: 1fr 80px 1fr;
+    align-items: start; gap: 12px; margin-top: 16px;
+  }
+  .preview-item {
+    background: var(--surface2); border-radius: var(--radius);
+    overflow: hidden; position: relative;
+  }
+  .preview-item .label {
+    position: absolute; top: 10px; left: 10px;
+    background: rgba(0,0,0,.65); color: #fff;
+    font-size: .75rem; font-weight: 700; padding: 4px 10px;
+    border-radius: 20px; z-index: 2;
+  }
+  .preview-item img { width: 100%; display: block; }
+  .preview-item .placeholder {
+    aspect-ratio: 1; display: flex; align-items: center;
+    justify-content: center; color: var(--text2); font-size: .85rem;
+  }
+  .preview-arrow {
+    display: flex; align-items: center; justify-content: center;
+    font-size: 2rem; color: var(--accent); font-weight: 700;
+  }
+
+  /* ── 操作按钮 ── */
+  .actions { display: flex; gap: 12px; flex-wrap: wrap; margin-top: 8px; }
+  .btn {
+    padding: 12px 28px; border-radius: 8px;
+    font-size: .95rem; font-weight: 700; cursor: pointer;
+    border: none; transition: all .2s; display: inline-flex;
+    align-items: center; gap: 8px;
+  }
+  .btn-primary {
+    background: var(--accent); color: #fff;
+    flex: 1; justify-content: center;
+  }
+  .btn-primary:hover { background: #5a4bd1; transform: translateY(-1px); }
+  .btn-primary:disabled {
+    background: #3b3680; color: #777; cursor: not-allowed; transform: none;
+  }
+  .btn-outline {
+    background: transparent; color: var(--text); border: 1px solid var(--border);
+  }
+  .btn-outline:hover { border-color: var(--accent2); color: var(--accent2); }
+
+  /* ── 状态 ── */
+  .status {
+    padding: 12px 16px; border-radius: 8px; font-size: .88rem;
+    display: none; align-items: center; gap: 8px;
+  }
+  .status.show { display: flex; }
+  .status.success { background: rgba(0,184,148,.12); color: var(--green); border: 1px solid rgba(0,184,148,.3); }
+  .status.error { background: rgba(255,118,117,.12); color: var(--red); border: 1px solid rgba(255,118,117,.3); }
+  .status.loading { background: rgba(108,92,231,.12); color: var(--accent2); border: 1px solid rgba(108,92,231,.3); }
+
+  /* ── 加载动画 ── */
+  .spinner {
+    width: 20px; height: 20px; border: 2px solid transparent;
+    border-top-color: currentColor; border-radius: 50%;
+    animation: spin .7s linear infinite;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+
+  /* ── 展开/折叠 ── */
+  .toggle-icon { transition: transform .2s; font-size: .8rem; }
+  .toggle-icon.open { transform: rotate(90deg); }
+  .collapsible-content { overflow: hidden; transition: max-height .35s ease; }
+  .collapsible-content.collapsed { max-height: 0 !important; }
+  @media (max-width: 640px) {
+    .preview-area { grid-template-columns: 1fr; }
+    .preview-arrow { transform: rotate(90deg); }
+    .task-grid { grid-template-columns: 1fr 1fr; }
+    .header h1 { font-size: 1.5rem; }
+  }
+</style>
+</head>
+<body>
+<div class="container">
+
+  <!-- ═══════════════ 头部 ═══════════════ -->
+  <div class="header">
+    <h1>✨ SwinIR 图像增强</h1>
+    <p class="subtitle">基于 Swin Transformer，支持超分辨率、去噪、JPEG 去伪影</p>
+  </div>
+
+  <!-- ═══════════════ 步骤一：选择任务 ═══════════════ -->
+  <div class="card">
+    <div class="card-title" id="taskHeader" style="cursor:pointer;user-select:none">
+      <span class="icon">🎯</span>
+      <span>增强任务：</span>
+      <span id="currentTaskLabel" style="color:var(--accent2)">真实世界超分</span>
+      <span class="toggle-icon" id="toggleIcon" style="margin-left:auto">▶</span>
+    </div>
+
+    <!-- 任务选择区（默认隐藏） -->
+    <div class="collapsible-content collapsed" id="taskCollapse" style="max-height:500px">
+      <div class="task-grid" id="taskGrid"></div>
+
+      <!-- 参数区（动态显示） -->
+      <div class="params" id="paramsArea">
+        <div class="param-group">
+          <label>超分倍数（Scale）</label>
+          <select id="paramScale">
+            <option value="1">1×</option><option value="2">2×</option>
+            <option value="3">3×</option><option value="4" selected>4×</option>
+            <option value="8">8×</option>
+          </select>
+        </div>
+        <div class="param-group" id="noiseGroup" style="display:none">
+          <label>噪声等级 σ（Noise）</label>
+          <select id="paramNoise">
+            <option value="15">15</option><option value="25" selected>25</option><option value="50">50</option>
+          </select>
+        </div>
+        <div class="param-group" id="jpegGroup" style="display:none">
+          <label>JPEG 质量因子（Quality）</label>
+          <select id="paramJpeg">
+            <option value="10">10</option><option value="20">20</option>
+            <option value="30">30</option><option value="40" selected>40</option>
+          </select>
+          <div class="hint">值越小压缩率越高，伪影越重</div>
+        </div>
+        <div class="param-group">
+          <label>分块大小（Tile，大图用）</label>
+          <input type="number" id="paramTile" placeholder="不填 = 整图推理" min="0" max="2000" value="">
+          <div class="hint">建议 400，需为窗口大小 7 或 8 的倍数</div>
+        </div>
+        <div class="param-group" id="largeGroup">
+          <label style="display:flex;align-items:center;gap:6px;cursor:pointer">
+            <input type="checkbox" id="paramLarge" style="width:auto">
+            使用大模型 SwinIR-L
+          </label>
+          <div class="hint">精度更高但更慢、更耗显存</div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ═══════════════ 步骤二：上传图像 ═══════════════ -->
+  <div class="card">
+    <div class="card-title"><span class="icon">📷</span> 上传待增强的图像</div>
+    <div class="upload-zone" id="uploadZone">
+      <div class="upload-icon">🖼️</div>
+      <div class="upload-text">点击上传或拖拽图像到此处</div>
+      <div class="upload-hint">支持 JPG / PNG / BMP / TIFF，最大 50MB</div>
+      <input type="file" id="fileInput" accept="image/jpeg,image/png,image/bmp,image/tiff">
+    </div>
+
+    <!-- 预览区 -->
+    <div class="preview-area" id="previewArea" style="display:none">
+      <div class="preview-item">
+        <div class="label">原始图像</div>
+        <img id="previewInput" alt="原始图像">
+      </div>
+      <div class="preview-arrow">→</div>
+      <div class="preview-item" id="outputBox">
+        <div class="placeholder" id="outputPlaceholder">等待增强…</div>
+        <img id="previewOutput" alt="增强结果" style="display:none">
+      </div>
+    </div>
+
+    <!-- 状态提示 -->
+    <div class="status" id="statusBox">
+      <span class="spinner" id="statusSpinner" style="display:none"></span>
+      <span id="statusText"></span>
+    </div>
+
+    <!-- 操作按钮 -->
+    <div class="actions">
+      <button class="btn btn-primary" id="btnEnhance" disabled>
+        🚀 开始增强
+      </button>
+      <button class="btn btn-outline" id="btnDownload" style="display:none">
+        💾 下载增强图像
+      </button>
+      <button class="btn btn-outline" id="btnReset" style="display:none">
+        🔄 重新上传
+      </button>
+    </div>
+  </div>
+
+  <!-- ═══════════════ 使用说明 ═══════════════ -->
+  <div class="card" style="font-size:.85rem;color:var(--text2);line-height:1.7">
+    <div class="card-title"><span class="icon">💡</span> 使用提示</div>
+    <ul style="padding-left:20px;display:flex;flex-direction:column;gap:4px">
+      <li>上传图像后点击「开始增强」，等待处理完成即可查看结果</li>
+      <li>大分辨率图像建议填写分块大小（如 400），避免显存不足</li>
+      <li>如需使用其他任务（经典 SR、轻量 SR 等），请在 <code>/tasks</code> 接口查看，然后在 <code>/predict</code> 中传参</li>
+      <li>服务默认监听 <code>0.0.0.0:8000</code>，可通过 <code>/docs</code> 访问 Swagger API 文档</li>
+      <li>Mac Apple Silicon 自动使用 MPS 加速，NVIDIA GPU 使用 CUDA 加速</li>
+    </ul>
+  </div>
+
+</div>
+
+<script>
+// ══════════════════════════════════════════════════════════════════
+// 配置：API 地址（自动检测同源，也可手动修改）
+// ══════════════════════════════════════════════════════════════════
+const API_BASE = window.location.origin;
+
+// ══════════════════════════════════════════════════════════════════
+// 任务定义
+// ══════════════════════════════════════════════════════════════════
+const TASKS = [
+  { key: 'real_sr',        name: '真实世界超分',    desc: '真实低质量图像 4× 放大', scale: [4],           extra: ['large_model'] },
+  { key: 'classical_sr',   name: '经典图像超分',    desc: 'bicubic 下采样的 SR 放大', scale: [2,3,4,8],   extra: ['training_patch_size'] },
+  { key: 'lightweight_sr', name: '轻量图像超分',    desc: '快速轻量的 SR 放大',     scale: [2,3,4],       extra: [] },
+  { key: 'gray_dn',        name: '灰度图像去噪',    desc: '去除灰度图中的高斯噪声', scale: [1],            extra: ['noise'] },
+  { key: 'color_dn',       name: '彩色图像去噪',    desc: '去除彩色图中的高斯噪声', scale: [1],            extra: ['noise'] },
+  { key: 'jpeg_car',       name: '灰度 JPEG 去伪影', desc: '修复灰度 JPEG 压缩块效应', scale: [1],         extra: ['jpeg'] },
+  { key: 'color_jpeg_car', name: '彩色 JPEG 去伪影', desc: '修复彩色 JPEG 压缩块效应', scale: [1],         extra: ['jpeg'] },
+];
+
+let currentTask = 'real_sr';
+let selectedFile = null;
+let resultBlob = null;
+
+// ── 任务选择折叠/展开 ─────────────────────────────────
+const taskCollapse = document.getElementById('taskCollapse');
+const toggleIcon = document.getElementById('toggleIcon');
+const currentTaskLabel = document.getElementById('currentTaskLabel');
+
+document.getElementById('taskHeader').addEventListener('click', () => {
+  const isOpen = !taskCollapse.classList.contains('collapsed');
+  taskCollapse.classList.toggle('collapsed', isOpen);
+  toggleIcon.classList.toggle('open', !isOpen);
+});
+
+// ══════════════════════════════════════════════════════════════════
+// 初始化任务选择器
+// ══════════════════════════════════════════════════════════════════
+(function initTaskGrid() {
+  const grid = document.getElementById('taskGrid');
+  TASKS.forEach(t => {
+    const btn = document.createElement('button');
+    btn.className = 'task-btn' + (t.key === currentTask ? ' active' : '');
+    btn.innerHTML = `<div class="name">${t.name}</div><div class="desc">${t.desc}</div>`;
+    btn.addEventListener('click', () => selectTask(t.key, btn));
+    grid.appendChild(btn);
+  });
+  updateParams();
+})();
+
+function selectTask(key, btn) {
+  currentTask = key;
+  currentTaskLabel.textContent = btn.querySelector('.name').textContent;
+  document.querySelectorAll('.task-btn').forEach(b => b.classList.remove('active'));
+  btn.classList.add('active');
+  updateParams();
+}
+
+function updateParams() {
+  const task = TASKS.find(t => t.key === currentTask) || TASKS[0];
+
+  // 超分倍数
+  const scaleEl = document.getElementById('paramScale');
+  scaleEl.innerHTML = task.scale.map(s => `<option value="${s}" ${s===task.scale[0]?'selected':''}>${s}×</option>`).join('');
+  scaleEl.disabled = task.scale.length === 1 && task.scale[0] === 1;
+
+  // 噪声
+  document.getElementById('noiseGroup').style.display   = task.extra.includes('noise') ? '' : 'none';
+  // JPEG
+  document.getElementById('jpegGroup').style.display    = task.extra.includes('jpeg') ? '' : 'none';
+  // 大模型（仅 real_sr 显示)
+  document.getElementById('largeGroup').style.display   = task.extra.includes('large_model') ? '' : 'none';
+}
+
+// ══════════════════════════════════════════════════════════════════
+// 文件上传（点击 + 拖拽）
+// ══════════════════════════════════════════════════════════════════
+const uploadZone = document.getElementById('uploadZone');
+const fileInput  = document.getElementById('fileInput');
+const btnEnhance = document.getElementById('btnEnhance');
+const previewArea = document.getElementById('previewArea');
+const previewInput = document.getElementById('previewInput');
+const previewOutput = document.getElementById('previewOutput');
+const outputPlaceholder = document.getElementById('outputPlaceholder');
+const statusBox = document.getElementById('statusBox');
+const statusText = document.getElementById('statusText');
+const statusSpinner = document.getElementById('statusSpinner');
+
+uploadZone.addEventListener('click', () => fileInput.click());
+
+['dragenter', 'dragover'].forEach(evt => {
+  uploadZone.addEventListener(evt, e => { e.preventDefault(); uploadZone.classList.add('drag-over'); });
+});
+['dragleave', 'drop'].forEach(evt => {
+  uploadZone.addEventListener(evt, e => { e.preventDefault(); uploadZone.classList.remove('drag-over'); });
+});
+uploadZone.addEventListener('drop', e => {
+  const files = e.dataTransfer.files;
+  if (files.length > 0) handleFile(files[0]);
+});
+
+fileInput.addEventListener('change', () => {
+  if (fileInput.files.length > 0) handleFile(fileInput.files[0]);
+});
+
+function handleFile(file) {
+  if (!file.type.match(/image\/(jpeg|png|bmp|tiff)/)) {
+    showStatus('error', '不支持的文件格式，请上传 JPG/PNG/BMP/TIFF 图像');
+    return;
+  }
+  if (file.size > 50 * 1024 * 1024) {
+    showStatus('error', '文件过大，请上传小于 50MB 的图像');
+    return;
+  }
+  selectedFile = file;
+  btnEnhance.disabled = false;
+
+  // 预览
+  const url = URL.createObjectURL(file);
+  previewInput.src = url;
+  previewArea.style.display = 'grid';
+  uploadZone.classList.add('has-image');
+  uploadZone.querySelector('.upload-icon').style.display = 'none';
+  uploadZone.querySelector('.upload-text').textContent = file.name;
+  uploadZone.querySelector('.upload-hint').textContent = `${(file.size/1024).toFixed(0)} KB`;
+
+  // 重置输出
+  previewOutput.style.display = 'none';
+  outputPlaceholder.style.display = '';
+  resultBlob = null;
+  document.getElementById('btnDownload').style.display = 'none';
+  document.getElementById('btnReset').style.display = '';
+  hideStatus();
+}
+
+// ══════════════════════════════════════════════════════════════════
+// 增强请求
+// ══════════════════════════════════════════════════════════════════
+btnEnhance.addEventListener('click', async () => {
+  if (!selectedFile) return;
+
+  showStatus('loading', '正在增强中，请耐心等待…');
+  statusSpinner.style.display = '';
+  btnEnhance.disabled = true;
+
+  const formData = new FormData();
+  formData.append('image', selectedFile);
+  formData.append('task', currentTask);
+  formData.append('scale', document.getElementById('paramScale').value);
+  if (document.getElementById('noiseGroup').style.display !== 'none')
+    formData.append('noise', document.getElementById('paramNoise').value);
+  if (document.getElementById('jpegGroup').style.display !== 'none')
+    formData.append('jpeg', document.getElementById('paramJpeg').value);
+  if (document.getElementById('largeGroup').style.display !== 'none' && document.getElementById('paramLarge').checked)
+    formData.append('large_model', 'true');
+  const tileVal = document.getElementById('paramTile').value;
+  if (tileVal && parseInt(tileVal) > 0) formData.append('tile', tileVal);
+
+  try {
+    const resp = await fetch(`${API_BASE}/predict`, { method: 'POST', body: formData });
+    if (!resp.ok) {
+      const err = await resp.json().catch(() => ({ detail: resp.statusText }));
+      throw new Error(err.detail || `HTTP ${resp.status}`);
+    }
+    resultBlob = await resp.blob();
+    const url = URL.createObjectURL(resultBlob);
+    previewOutput.src = url;
+    previewOutput.style.display = '';
+    outputPlaceholder.style.display = 'none';
+    document.getElementById('btnDownload').style.display = '';
+    showStatus('success', '增强完成！');
+  } catch (err) {
+    showStatus('error', `增强失败：${err.message}`);
+  } finally {
+    statusSpinner.style.display = 'none';
+    btnEnhance.disabled = false;
+  }
+});
+
+// ══════════════════════════════════════════════════════════════════
+// 下载 & 重置
+// ══════════════════════════════════════════════════════════════════
+document.getElementById('btnDownload').addEventListener('click', () => {
+  if (!resultBlob) return;
+  const url = URL.createObjectURL(resultBlob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = 'enhanced.png';
+  a.click();
+  URL.revokeObjectURL(url);
+});
+
+document.getElementById('btnReset').addEventListener('click', () => {
+  selectedFile = null;
+  resultBlob = null;
+  fileInput.value = '';
+  btnEnhance.disabled = true;
+  previewArea.style.display = 'none';
+  previewInput.src = '';
+  previewOutput.src = '';
+  previewOutput.style.display = 'none';
+  outputPlaceholder.style.display = '';
+  document.getElementById('btnDownload').style.display = 'none';
+  document.getElementById('btnReset').style.display = 'none';
+  uploadZone.classList.remove('has-image');
+  uploadZone.querySelector('.upload-icon').style.display = '';
+  uploadZone.querySelector('.upload-text').textContent = '点击上传或拖拽图像到此处';
+  uploadZone.querySelector('.upload-hint').textContent = '支持 JPG / PNG / BMP / TIFF，最大 50MB';
+  hideStatus();
+});
+
+// ══════════════════════════════════════════════════════════════════
+// 状态提示
+// ══════════════════════════════════════════════════════════════════
+function showStatus(type, msg) {
+  statusBox.className = `status show ${type}`;
+  statusText.textContent = msg;
+}
+function hideStatus() {
+  statusBox.className = 'status';
+  statusSpinner.style.display = 'none';
+  statusText.textContent = '';
+}
+</script>
+</body>
+</html>
