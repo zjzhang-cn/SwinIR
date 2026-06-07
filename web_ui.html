@@ -473,6 +473,49 @@ function updateProgress(current, total) {
 }
 
 // ══════════════════════════════════════════════════════════════════
+// 会话 ID（每个 tab 唯一，互不干扰）
+// ══════════════════════════════════════════════════════════════════
+const sessionId = crypto.randomUUID();
+
+// ── 心跳机制：每 5 秒告知后端此会话存活 ─────────────────
+// 页面关闭后心跳停止，后端超时自动清理并取消推理
+const HEARTBEAT_INTERVAL = 5000;
+let heartbeatTimer = null;
+
+function startHeartbeat() {
+  if (heartbeatTimer) return;
+  heartbeatTimer = setInterval(async () => {
+    try {
+      const fd = new FormData();
+      fd.append('session_id', sessionId);
+      await fetch(`${API_BASE}/heartbeat`, { method: 'POST', body: fd });
+    } catch (e) {
+      // 心跳失败忽略（网络波动或服务暂不可用）
+    }
+  }, HEARTBEAT_INTERVAL);
+  // 立即发一次
+  (async () => {
+    try {
+      const fd = new FormData();
+      fd.append('session_id', sessionId);
+      await fetch(`${API_BASE}/heartbeat`, { method: 'POST', body: fd });
+    } catch (e) {}
+  })();
+}
+
+function stopHeartbeat() {
+  if (heartbeatTimer) { clearInterval(heartbeatTimer); heartbeatTimer = null; }
+}
+
+// 页面加载后开始心跳
+startHeartbeat();
+
+// 页面关闭/刷新时停止心跳
+window.addEventListener('beforeunload', stopHeartbeat);
+// 页面隐藏（切到后台）时不中断心跳，恢复可见时仍在
+// Visibility API 不需要额外处理，setInterval 在后台也能运行
+
+// ══════════════════════════════════════════════════════════════════
 // 增强请求（无 tile 用普通请求，有 tile 用 SSE 流式进度）
 // ══════════════════════════════════════════════════════════════════
 btnEnhance.addEventListener('click', async () => {
@@ -575,6 +618,7 @@ function buildFormData() {
   fd.append('image', selectedFile);
   fd.append('task', currentTask);
   fd.append('scale', document.getElementById('paramScale').value);
+  fd.append('session_id', sessionId);
   if (document.getElementById('noiseGroup').style.display !== 'none')
     fd.append('noise', document.getElementById('paramNoise').value);
   if (document.getElementById('jpegGroup').style.display !== 'none')

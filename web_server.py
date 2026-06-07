@@ -19,10 +19,12 @@ API 端点：
 import argparse
 import base64
 import io
+import logging
 import os
 import queue
 import sys
 import threading
+import time
 from types import SimpleNamespace
 
 import cv2
@@ -35,7 +37,13 @@ from fastapi.responses import FileResponse, HTMLResponse, Response
 from PIL import Image
 from starlette.responses import StreamingResponse
 
-# 导入 run_predict.py 中的核心函数
+# ── 日志配置 ────────────────────────────────────────────
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s [%(levelname)s] %(message)s',
+    datefmt='%H:%M:%S',
+)
+logger = logging.getLogger('swinir')
 from run_predict import (
     build_model,
     get_window_size,
@@ -51,7 +59,53 @@ from run_predict import (
 model = None
 device = None
 base_args = None  # 基础配置（model_path、task、scale 等）
-current_cancel_event = threading.Event()  # 当前运行中的推理取消信号
+# 会话管理：{session_id: {'event': threading.Event, 'last_seen': float}}
+# 每个浏览器 tab（页面）生成唯一 session_id，同 session 新请求取消上一次推理
+sessions = {}
+session_lock = threading.Lock()
+SESSION_TIMEOUT = 30  # 心跳超时时间（秒），超过此时间无心跳则认为会话已失效
+
+
+def _get_or_cancel_session(session_id: str):
+    """获取 session 的 cancel_event，如果该 session 有正在运行的推理则取消它。"""
+    with session_lock:
+        now = time.time()
+        if session_id in sessions:
+            old = sessions[session_id]
+            if not old['event'].is_set():
+                old['event'].set()
+                logger.info(f'取消 session [{session_id[:8]}] 的上一次推理')
+        cancel_event = threading.Event()
+        sessions[session_id] = {'event': cancel_event, 'last_seen': now}
+        logger.info(f'session [{session_id[:8]}] 创建，当前活跃会话: {len(sessions)}')
+        return cancel_event
+
+
+def _update_session_heartbeat(session_id: str):
+    """更新 session 的心跳时间戳。"""
+    with session_lock:
+        if session_id in sessions:
+            sessions[session_id]['last_seen'] = time.time()
+
+
+def _cleanup_stale_sessions():
+    """清理超时未收到心跳的会话，取消其正在运行的推理。"""
+    with session_lock:
+        now = time.time()
+        stale = [sid for sid, info in sessions.items()
+                 if now - info['last_seen'] > SESSION_TIMEOUT]
+        for sid in stale:
+            info = sessions.pop(sid)
+            if not info['event'].is_set():
+                info['event'].set()
+                logger.info(f'会话 [{sid[:8]}] 心跳超时 ({SESSION_TIMEOUT}s)，已自动清理')
+
+
+def _remove_session(session_id: str):
+    """session 推理结束后清理。"""
+    with session_lock:
+        sessions.pop(session_id, None)
+        logger.info(f'session [{session_id[:8]}] 已清理，剩余活跃会话: {len(sessions)}')
 
 
 def create_args(**overrides):
@@ -88,14 +142,17 @@ def load_model(model_path: str):
         dev = torch.device('mps')
     else:
         dev = torch.device('cpu')
-    print(f'[初始化] 计算设备: {dev}')
+    logger.info(f'计算设备: {dev}')
 
     # 构建模型配置
     args = create_args(model_path=model_path)
+    logger.info(f'正在加载模型: {model_path}')
     m = build_model(args)
     m.eval()
     m = m.to(dev)
-    print(f'[初始化] 模型加载完成: {model_path}')
+    # 统计模型参数量
+    total_params = sum(p.numel() for p in m.parameters())
+    logger.info(f'模型加载完成 | 参数量: {total_params / 1e6:.1f}M | 设备: {dev}')
     return m, dev
 
 
@@ -117,7 +174,7 @@ app.add_middleware(
     allow_headers=['*'],
 )
 
-# 启动事件：加载模型
+# 启动事件：加载模型 + 启动会话清理线程
 @app.on_event('startup')
 async def startup():
     global model, device, base_args
@@ -133,11 +190,18 @@ async def startup():
     parser.add_argument('--port', type=int, default=8000)
     parser.add_argument('--host', type=str, default='0.0.0.0')
 
-    # 从命令行解析（兼容 python web_server.py --xxx 的调用方式）
-    # 过滤掉 uvicorn 不识别的参数
     known, _ = parser.parse_known_args()
     base_args = known
     model, device = load_model(known.model_path)
+
+    # 启动后台会话清理线程，每 10 秒检查一次超时会话
+    def cleanup_loop():
+        while True:
+            time.sleep(10)
+            _cleanup_stale_sessions()
+    cleanup_thread = threading.Thread(target=cleanup_loop, daemon=True)
+    cleanup_thread.start()
+    logger.info(f'会话清理线程已启动（超时阈值: {SESSION_TIMEOUT}s）')
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -161,6 +225,18 @@ async def health():
         'device': str(device) if device else 'none',
         'task': base_args.task if base_args else 'unknown',
     }
+
+
+@app.post('/heartbeat')
+async def heartbeat(
+    session_id: str = Form(..., description='会话 ID'),
+):
+    """
+    心跳接口 — 前端每 5 秒调用一次，告知后端此会话仍然存活。
+    如果前端停止心跳（页面关闭/崩溃），后台清理线程会在超时后自动取消该会话的推理。
+    """
+    _update_session_heartbeat(session_id)
+    return {'status': 'ok', 'session': session_id[:8]}
 
 
 @app.get('/tasks')
@@ -250,9 +326,14 @@ def _decode_image(contents: bytes, task: str):
 
 def _do_inference(img_lq: np.ndarray, task: str, scale: int, noise: int,
                   jpeg: int, large_model: bool, tile, tile_overlap: int,
-                  progress_queue: queue.Queue, cancel_event: threading.Event = None):
+                  progress_queue: queue.Queue, cancel_event: threading.Event = None,
+                  session_id: str = ''):
     """在后台线程中执行推理，通过 progress_queue 发送进度，通过 cancel_event 支持取消。"""
+    sid = session_id[:8] if session_id else '???'
+    h, w = img_lq.shape[1], img_lq.shape[2]
+    start_time = time.time()
     try:
+        logger.info(f'[{sid}] 开始推理 | 任务: {task} | 图像: {w}×{h} | tile: {tile}')
         args = create_args(
             task=task, scale=scale, noise=noise, jpeg=jpeg,
             large_model=large_model, tile=tile, tile_overlap=tile_overlap,
@@ -267,23 +348,36 @@ def _do_inference(img_lq: np.ndarray, task: str, scale: int, noise: int,
             tensor = torch.cat([tensor, torch.flip(tensor, [2])], 2)[:, :, :h_old + h_pad, :]
             tensor = torch.cat([tensor, torch.flip(tensor, [3])], 3)[:, :, :, :w_old + w_pad]
 
-            # 如果有 tile，传入进度回调和取消信号
             if tile and tile > 0:
                 def on_progress(current, total):
                     if cancel_event and cancel_event.is_set():
+                        logger.info(f'[{sid}] 推理被取消 (tile {current}/{total})')
                         raise InterruptedError('客户端断开连接')
                     progress_queue.put({'type': 'progress', 'current': current, 'total': total})
+                    logger.info(f'[{sid}] 分块推理进度: {current}/{total} ({current*100//total}%)')
                 output = run_inference(tensor, model, args, window_size,
                                        progress_callback=on_progress,
                                        cancel_event=cancel_event)
             else:
-                output = run_inference(tensor, model, args, window_size,
-                                       cancel_event=cancel_event)
+                output = run_inference(tensor, model, args, window_size)
 
-        # output 为 None 表示推理被取消
         if output is None:
-            progress_queue.put({'type': 'error', 'message': '推理已取消（客户端断开连接）'})
+            progress_queue.put({'type': 'error', 'message': '推理已取消'})
             return
+
+        result = tensor_to_image(output, task, h_old, w_old, scale)
+        success, encoded = cv2.imencode('.png', result)
+        if not success:
+            raise RuntimeError('图像编码失败')
+        img_b64 = base64.b64encode(encoded.tobytes()).decode('utf-8')
+        elapsed = time.time() - start_time
+        logger.info(f'[{sid}] 推理完成 | 耗时: {elapsed:.2f}s | 输出: {result.shape[1]}×{result.shape[0]}')
+        progress_queue.put({'type': 'done', 'image': img_b64})
+    except InterruptedError:
+        pass  # 已在 on_progress 中记录日志
+    except Exception as e:
+        logger.error(f'[{sid}] 推理异常: {e}')
+        progress_queue.put({'type': 'error', 'message': str(e)})
 
         result = tensor_to_image(output, task, h_old, w_old, scale)
         success, encoded = cv2.imencode('.png', result)
@@ -305,6 +399,7 @@ async def predict_stream(
     large_model: bool = Form(False),
     tile: int = Form(None),
     tile_overlap: int = Form(32),
+    session_id: str = Form(..., description='会话 ID（每个浏览器 tab 唯一）'),
 ):
     """分块推理时返回 SSE 进度流，结束时通过 done 事件返回 base64 图像。"""
     if model is None:
@@ -321,21 +416,16 @@ async def predict_stream(
     except Exception as e:
         raise HTTPException(status_code=400, detail=f'图像读取失败: {str(e)}')
 
-    # 取消上一次推理（同一页面只允许一个推理任务）
-    global current_cancel_event
-    if not current_cancel_event.is_set():
-        current_cancel_event.set()
-        print('[会话管理] 取消上一次推理')
+    # 按 session 取消上一次推理，创建新的 cancel_event
+    cancel_event = _get_or_cancel_session(session_id)
+    logger.info(f'[{session_id[:8]}] 新推理请求 | 任务: {task} | 图像: {img_lq.shape[2]}×{img_lq.shape[1]} | tile: {tile}')
 
     q = queue.Queue()
-    cancel_event = threading.Event()
-    current_cancel_event = cancel_event  # 更新全局引用
 
     def sse_generator():
-        # 启动后台推理线程
         thread = threading.Thread(
             target=_do_inference,
-            args=(img_lq, task, scale, noise, jpeg, large_model, tile, tile_overlap, q, cancel_event),
+            args=(img_lq, task, scale, noise, jpeg, large_model, tile, tile_overlap, q, cancel_event, session_id),
             daemon=True,
         )
         thread.start()
@@ -355,15 +445,15 @@ async def predict_stream(
                         yield 'data: {"type":"end"}\n\n'
                         break
                 except queue.Empty:
-                    # 发送心跳保持连接
                     yield ': heartbeat\n\n'
                     if not thread.is_alive():
                         break
         except GeneratorExit:
-            # 客户端断开连接（关闭页面），触发取消信号停止推理
             cancel_event.set()
-            print('[推理取消] 客户端断开连接，停止推理')
+            logger.info(f'[{session_id[:8]}] 客户端断开连接，已取消推理')
             raise
+        finally:
+            _remove_session(session_id)
 
     return StreamingResponse(
         sse_generator(),
@@ -386,6 +476,7 @@ async def predict(
     large_model: bool = Form(False, description='是否使用 SwinIR-L 大模型，仅 real_sr 有效'),
     tile: int = Form(None, description='分块大小，大图推理避免显存不足（需为 window_size 的倍数）'),
     tile_overlap: int = Form(32, description='分块重叠像素数'),
+    session_id: str = Form(None, description='会话 ID（可选，用于会话管理）'),
 ):
     """
     上传一张图像进行增强处理，返回增强后的图像。
@@ -431,6 +522,10 @@ async def predict(
     # ── 预处理 ──────────────────────────────────────────
     img_lq = torch.from_numpy(img_lq).float().unsqueeze(0).to(device)  # → NCHW
 
+    sid = (session_id or 'no-session')[:8]
+    logger.info(f'[{sid}] /predict 请求 | 任务: {task} | 图像: {img_lq.shape[2]}×{img_lq.shape[1]}')
+    start_time = time.time()
+
     # ── 推理 ────────────────────────────────────────────
     try:
         with torch.no_grad():
@@ -448,13 +543,16 @@ async def predict(
         result = tensor_to_image(output, task, h_old, w_old, scale)
 
     except Exception as e:
+        logger.error(f'[{sid}] 推理失败: {e}')
         raise HTTPException(status_code=500, detail=f'推理失败: {str(e)}')
 
     # ── 返回图像 ────────────────────────────────────────
-    # 将 numpy 图像编码为 PNG 字节流返回
     success, encoded = cv2.imencode('.png', result)
     if not success:
         raise HTTPException(status_code=500, detail='图像编码失败')
+
+    elapsed = time.time() - start_time
+    logger.info(f'[{sid}] /predict 完成 | 耗时: {elapsed:.2f}s | 输出: {result.shape[1]}×{result.shape[0]}')
 
     return Response(
         content=encoded.tobytes(),
@@ -494,13 +592,13 @@ if __name__ == '__main__':
     # 预加载模型
     model, device = load_model(args.model_path)
 
-    print(f'\n{"=" * 60}')
-    print(f'  SwinIR Web 推理服务已启动')
-    print(f'  地址: http://{args.host}:{args.port}')
-    print(f'  API 文档: http://{args.host}:{args.port}/docs')
-    print(f'  任务: {args.task}')
-    print(f'  设备: {device}')
-    print(f'{"=" * 60}\n')
+    logger.info('=' * 50)
+    logger.info(f'SwinIR Web 推理服务已启动')
+    logger.info(f'地址: http://{args.host}:{args.port}')
+    logger.info(f'API 文档: http://{args.host}:{args.port}/docs')
+    logger.info(f'Web 页面: http://{args.host}:{args.port}')
+    logger.info(f'默认任务: {args.task} | 设备: {device}')
+    logger.info('=' * 50)
 
     # 启动 FastAPI（注意：多 worker 模式下每个进程独立加载模型）
     uvicorn.run(
